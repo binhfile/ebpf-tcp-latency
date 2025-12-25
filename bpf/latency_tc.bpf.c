@@ -18,7 +18,16 @@ struct latency_event {
     __u32 seq;          /* TCP seq */
     __u32 ack;          /* TCP ack */
     __u64 latency_ns;  /* thời gian (ns) hoặc timestamp */
+    __u16 src_port;    /* Source port */
+    __u16 dst_port;    /* Destination port */
     __u8  direction;   /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST */
+};
+
+/* Pending entry - stores timestamp and port info for each DATA packet */
+struct pending_entry {
+    __u64 timestamp;    /* ktime_get_ns() */
+    __u16 src_port;     /* Source port of DATA packet */
+    __u16 dst_port;     /* Destination port of DATA packet */
 };
 
 /* -------------------- BPF maps -------------------- */
@@ -26,8 +35,8 @@ struct latency_event {
 /* 1. pending: lưu thời gian gửi DATA, key = seq (u32) */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32);      /* TCP seq */
-    __type(value, __u64);    /* ktime_get_ns() */
+    __type(key, __u32);                  /* TCP seq */
+    __type(value, struct pending_entry); /* timestamp + ports */
     __uint(max_entries, 65536);
 } pending SEC(".maps");
 
@@ -93,7 +102,6 @@ int latency_tc_egress(struct __sk_buff *skb)
     void *data_end = (void *)(unsigned long)skb->data_end;
     struct iphdr   *iph;
     struct tcphdr  *tcph;
-    __u64 ts;
     __u32 key;
     struct latency_event *ev;
 
@@ -131,6 +139,8 @@ int latency_tc_egress(struct __sk_buff *skb)
                 ev->seq = bpf_ntohl(tcph->seq);
                 ev->ack = bpf_ntohl(tcph->ack_seq);
                 ev->latency_ns = bpf_ktime_get_ns();
+                ev->src_port = bpf_ntohs(tcph->source);
+                ev->dst_port = bpf_ntohs(tcph->dest);
                 if (tcph->syn)
                     ev->direction = 2;  /* SYN */
                 else if (tcph->fin)
@@ -164,10 +174,13 @@ int latency_tc_egress(struct __sk_buff *skb)
         if (bytes_sent)
             *bytes_sent += payload_len;
 
-        /* Store timestamp at SEQ + payload_len (the expected ACK number) */
+        /* Store timestamp and port info at SEQ + payload_len (the expected ACK number) */
         key = bpf_ntohl(tcph->seq) + payload_len;
-        ts  = bpf_ktime_get_ns();
-        bpf_map_update_elem(&pending, &key, &ts, BPF_ANY);
+        struct pending_entry entry = {};  /* Zero-initialize all bytes */
+        entry.timestamp = bpf_ktime_get_ns();
+        entry.src_port = bpf_ntohs(tcph->source);
+        entry.dst_port = bpf_ntohs(tcph->dest);
+        bpf_map_update_elem(&pending, &key, &entry, BPF_ANY);
     }
 
     return TC_ACT_OK;
@@ -183,7 +196,7 @@ int latency_tc_ingress(struct __sk_buff *skb)
     struct tcphdr  *tcph;
     __u64 ts;
     __u32 key;
-    __u64 *pval;
+    struct pending_entry *pval;
     struct latency_event *ev;
 
     /* Don't count ingress in total (already counted in egress if bidirectional) */
@@ -210,6 +223,8 @@ int latency_tc_ingress(struct __sk_buff *skb)
                 ev->seq = bpf_ntohl(tcph->seq);
                 ev->ack = bpf_ntohl(tcph->ack_seq);
                 ev->latency_ns = bpf_ktime_get_ns();
+                ev->src_port = bpf_ntohs(tcph->source);
+                ev->dst_port = bpf_ntohs(tcph->dest);
                 if (tcph->syn)
                     ev->direction = 2;  /* SYN */
                 else if (tcph->fin)
@@ -252,13 +267,17 @@ int latency_tc_ingress(struct __sk_buff *skb)
         if (lookup_cnt)
             *lookup_cnt += 1;
 
-        /* Tìm timestamp đã lưu */
+        /* Tìm timestamp và port info đã lưu */
         pval = bpf_map_lookup_elem(&pending, &key);
         if (!pval)
             return TC_ACT_OK;   /* không có DATA tương ứng */
 
         /* Tính latency */
-        __u64 latency = ts - *pval;
+        __u64 latency = ts - pval->timestamp;
+
+        /* Save port info before deleting entry */
+        __u16 src_port = pval->src_port;
+        __u16 dst_port = pval->dst_port;
 
         /* Xóa entry */
         bpf_map_delete_elem(&pending, &key);
@@ -272,12 +291,14 @@ int latency_tc_ingress(struct __sk_buff *skb)
             *cnt += 1;
         }
 
-        /* Gửi sự kiện qua ring‑buffer (để user‑space có thể in chi tiết) */
+        /* Gửi sự kiện qua ring‑buffer với port info */
         ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
         if (ev) {
             ev->seq      = key;  /* This is the ACK number that matched */
             ev->ack      = key;
             ev->latency_ns = latency;
+            ev->src_port = src_port;
+            ev->dst_port = dst_port;
             ev->direction = 1;   /* ACK */
             bpf_ringbuf_submit(ev, 0);
         }

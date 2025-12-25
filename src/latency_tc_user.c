@@ -21,11 +21,29 @@ struct latency_event {
     __u32 seq;
     __u32 ack;
     __u64 latency_ns;
+    __u16 src_port;
+    __u16 dst_port;
     __u8  direction;  /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST */
 };
 
+/* Per-port statistics */
+struct port_stats {
+    __u64 sum_latency;
+    __u64 count;
+    __u16 local_port;
+    __u16 remote_port;
+};
+
+#define MAX_PORT_STATS 1024
+static struct port_stats port_stats_array[MAX_PORT_STATS];
+static int num_port_stats = 0;
+
 static volatile bool exiting = false;
 static FILE *logfile = NULL;
+
+/* ANSI color codes */
+#define COLOR_RED "\033[1;31m"
+#define COLOR_RESET "\033[0m"
 
 static void sig_handler(int sig)
 {
@@ -59,6 +77,65 @@ static void dual_printf(const char *format, ...)
     va_end(args2);
 }
 
+/* Helper to print colored text to stdout, plain text to log file */
+static void dual_printf_color(const char *color, const char *format, ...)
+{
+    va_list args1, args2;
+    char buffer[512];
+
+    va_start(args1, format);
+    va_copy(args2, args1);
+
+    /* Format the message */
+    vsnprintf(buffer, sizeof(buffer), format, args1);
+
+    /* Print to stdout with color */
+    printf("%s%s%s", color, buffer, COLOR_RESET);
+    fflush(stdout);
+
+    /* Print to log file without color */
+    if (logfile) {
+        fprintf(logfile, "%s", buffer);
+        fflush(logfile);
+    }
+
+    va_end(args1);
+    va_end(args2);
+}
+
+/* Find or create port stats entry */
+static struct port_stats* get_port_stats(__u16 local_port, __u16 remote_port)
+{
+    /* Search for existing entry */
+    for (int i = 0; i < num_port_stats; i++) {
+        if (port_stats_array[i].local_port == local_port &&
+            port_stats_array[i].remote_port == remote_port) {
+            return &port_stats_array[i];
+        }
+    }
+
+    /* Create new entry if space available */
+    if (num_port_stats < MAX_PORT_STATS) {
+        struct port_stats *stats = &port_stats_array[num_port_stats++];
+        stats->sum_latency = 0;
+        stats->count = 0;
+        stats->local_port = local_port;
+        stats->remote_port = remote_port;
+        return stats;
+    }
+
+    return NULL;  /* No space */
+}
+
+/* Reset all port stats */
+static void reset_port_stats(void)
+{
+    for (int i = 0; i < num_port_stats; i++) {
+        port_stats_array[i].sum_latency = 0;
+        port_stats_array[i].count = 0;
+    }
+}
+
 /* Format bytes to human readable */
 static void format_bytes(double bytes, char *buf, size_t buf_size)
 {
@@ -87,10 +164,12 @@ static void print_report(struct latency_tc_bpf *obj)
     __u64 *values;
 
     static __u64 prev_bytes_sent = 0, prev_bytes_recv = 0;
+    static __u64 prev_data_sent = 0, prev_ack_recv = 0;
     static time_t prev_time = 0;
     time_t now = time(NULL);
     double tx_speed = 0, rx_speed = 0;
     char tx_speed_str[32], rx_speed_str[32];
+    __u64 window_data_sent = 0, window_ack_recv = 0;
 
     if (nr_cpus <= 0) {
         fprintf(stderr, "Failed to get number of CPUs\n");
@@ -147,6 +226,17 @@ static void print_report(struct latency_tc_bpf *obj)
 
     free(values);
 
+    /* Calculate window deltas for data/ack counts */
+    if (prev_time > 0) {
+        window_data_sent = data_sent - prev_data_sent;
+        window_ack_recv = ack_recv - prev_ack_recv;
+    } else {
+        window_data_sent = data_sent;
+        window_ack_recv = ack_recv;
+    }
+    prev_data_sent = data_sent;
+    prev_ack_recv = ack_recv;
+
     /* Calculate speed */
     if (prev_time > 0) {
         time_t time_delta = now - prev_time;
@@ -169,11 +259,38 @@ static void print_report(struct latency_tc_bpf *obj)
 
     if (cnt > 0) {
         double avg_us = (double)sum / cnt / 1000.0;   /* ns → µs */
-        dual_printf("  avg=%.3f µs", avg_us);
+        if (avg_us >= 10000.0) {
+            dual_printf_color(COLOR_RED, "  avg=%.3f µs", avg_us);
+        } else {
+            dual_printf("  avg=%.3f µs", avg_us);
+        }
     }
 
     dual_printf("  tx=%s rx=%s", tx_speed_str, rx_speed_str);
+    dual_printf("  win_data=%llu win_ack=%llu",
+           (unsigned long long)window_data_sent, (unsigned long long)window_ack_recv);
     dual_printf("\n");
+
+    /* Print per-port latency statistics */
+    if (num_port_stats > 0) {
+        // dual_printf("Per-port latency (2s window):\n");
+        for (int i = 0; i < num_port_stats; i++) {
+            struct port_stats *ps = &port_stats_array[i];
+            if (ps->count > 0) {
+                double avg_us = (double)ps->sum_latency / ps->count / 1000.0;  /* ns → µs */
+                if (avg_us >= 10000.0) {
+                    dual_printf("  Port %u:%u -> samples=%llu ",
+                           ps->local_port, ps->remote_port,
+                           (unsigned long long)ps->count);
+                    dual_printf_color(COLOR_RED, "avg=%.3f µs\n", avg_us);
+                } else {
+                    dual_printf("  Port %u:%u -> samples=%llu avg=%.3f µs\n",
+                           ps->local_port, ps->remote_port,
+                           (unsigned long long)ps->count, avg_us);
+                }
+            }
+        }
+    }
 
     /* Reset latency stats for next window (keep cumulative stats) */
     values = calloc(nr_cpus, sizeof(__u64));
@@ -186,6 +303,9 @@ static void print_report(struct latency_tc_bpf *obj)
         bpf_map_update_elem(fd, &cnt_key, values, BPF_ANY);
         free(values);
     }
+
+    /* Reset per-port stats for next window */
+    reset_port_stats();
 }
 
 /* Ring‑buffer callback – show connection lifecycle events */
@@ -203,19 +323,26 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     switch (e->direction) {
         case 0:  /* DATA packet - skip */
             break;
-        case 1:  /* ACK/latency measurement - skip */
+        case 1:  /* ACK/latency measurement - track per-port stats */
+            {
+                struct port_stats *ps = get_port_stats(e->src_port, e->dst_port);
+                if (ps) {
+                    ps->sum_latency += e->latency_ns;
+                    ps->count += 1;
+                }
+            }
             break;
         case 2:  /* SYN - new connection */
-            dual_printf("[%s] [SYN] New connection initiated - seq=%u\n",
-                   time_str, e->seq);
+            dual_printf("[%s] [SYN] New connection initiated - port %u:%u seq=%u\n",
+                   time_str, e->src_port, e->dst_port, e->seq);
             break;
         case 3:  /* FIN - connection closing */
-            dual_printf("[%s] [FIN] Connection closing - seq=%u ack=%u\n",
-                   time_str, e->seq, e->ack);
+            dual_printf("[%s] [FIN] Connection closing - port %u:%u seq=%u ack=%u\n",
+                   time_str, e->src_port, e->dst_port, e->seq, e->ack);
             break;
         case 4:  /* RST - connection reset */
-            dual_printf("[%s] [RST] Connection reset - seq=%u ack=%u\n",
-                   time_str, e->seq, e->ack);
+            dual_printf("[%s] [RST] Connection reset - port %u:%u seq=%u ack=%u\n",
+                   time_str, e->src_port, e->dst_port, e->seq, e->ack);
             break;
     }
     return 0;
@@ -228,6 +355,7 @@ int main(int argc, char **argv)
     int err;
     const char *ifname = NULL;
     const char *target_ip_str = NULL;
+    const char *log_filename = "log.txt";  /* Default log file */
     __u32 ifindex = 0;
     __u32 target_ip_host = 0;
     struct in_addr addr;
@@ -237,24 +365,31 @@ int main(int argc, char **argv)
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts_egress, .handle = 1, .priority = 1);
     bool hook_created = false;
 
-    if (argc < 3 || argc > 4) {
-        fprintf(stderr, "Usage: %s <ifname> <target_ip> [--no-eth]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <ifname> <target_ip> [--no-eth] [--log <filename>]\n", argv[0]);
         fprintf(stderr, "  --no-eth: Use for TUN interfaces (no Ethernet header)\n");
+        fprintf(stderr, "  --log <filename>: Specify log file (default: log.txt)\n");
         fprintf(stderr, "Examples:\n");
         fprintf(stderr, "  %s eth0 10.0.0.2\n", argv[0]);
         fprintf(stderr, "  %s tun0 112.11.0.100 --no-eth\n", argv[0]);
-        fprintf(stderr, "  %s enp0s31f6 192.168.100.70\n", argv[0]);
+        fprintf(stderr, "  %s enp0s31f6 192.168.100.70 --log my_latency.log\n", argv[0]);
         return 1;
     }
     ifname = argv[1];
     target_ip_str = argv[2];
 
-    /* Check for --no-eth flag */
-    if (argc == 4) {
-        if (strcmp(argv[3], "--no-eth") == 0) {
+    /* Parse optional arguments */
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--no-eth") == 0) {
             no_eth = 1;
+        } else if (strcmp(argv[i], "--log") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --log requires a filename argument\n");
+                return 1;
+            }
+            log_filename = argv[++i];
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[3]);
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
         }
     }
@@ -354,12 +489,12 @@ int main(int argc, char **argv)
     signal(SIGTERM, sig_handler);
 
     /* Open log file */
-    logfile = fopen("log.txt", "a");
+    logfile = fopen(log_filename, "a");
     if (!logfile) {
-        fprintf(stderr, "Warning: Failed to open log.txt for writing: %s\n", strerror(errno));
+        fprintf(stderr, "Warning: Failed to open %s for writing: %s\n", log_filename, strerror(errno));
         fprintf(stderr, "Continuing without file logging...\n");
     } else {
-        printf("✓ Logging to log.txt\n");
+        printf("✓ Logging to %s\n", log_filename);
     }
 
     printf("\n=== eBPF TC latency monitor ===\n");
