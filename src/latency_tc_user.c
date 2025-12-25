@@ -162,7 +162,7 @@ static void print_report(struct latency_tc_bpf *obj)
     format_bytes(tx_speed, tx_speed_str, sizeof(tx_speed_str));
     format_bytes(rx_speed, rx_speed_str, sizeof(rx_speed_str));
 
-    dual_printf("[%-9s] total=%llu tcp=%llu matched=%llu data_sent=%llu ack_recv=%llu lookups=%llu latency=%llu",
+    dual_printf("[%-9s] total=%llu tcp=%llu matched=%llu data_sent=%llu ack_recv=%llu lookups=%llu num_samples=%llu",
            "REPORT", (unsigned long long)total, (unsigned long long)tcp_cnt,
            (unsigned long long)match_cnt, (unsigned long long)data_sent,
            (unsigned long long)ack_recv, (unsigned long long)lookups, (unsigned long long)cnt);
@@ -174,6 +174,18 @@ static void print_report(struct latency_tc_bpf *obj)
 
     dual_printf("  tx=%s rx=%s", tx_speed_str, rx_speed_str);
     dual_printf("\n");
+
+    /* Reset latency stats for next window (keep cumulative stats) */
+    values = calloc(nr_cpus, sizeof(__u64));
+    if (values) {
+        /* Reset sum and cnt across all CPUs */
+        for (int i = 0; i < nr_cpus; i++) {
+            values[i] = 0;
+        }
+        bpf_map_update_elem(fd, &sum_key, values, BPF_ANY);
+        bpf_map_update_elem(fd, &cnt_key, values, BPF_ANY);
+        free(values);
+    }
 }
 
 /* Ring‑buffer callback – show connection lifecycle events */
@@ -372,10 +384,10 @@ int main(int argc, char **argv)
             break;
         }
 
-        /* In báo cáo mỗi giây */
+        /* In báo cáo mỗi 2 giây */
         static time_t last = 0;
         time_t now = time(NULL);
-        if (now != last) {
+        if (now - last >= 2) {
             print_report(skel);
             last = now;
         }

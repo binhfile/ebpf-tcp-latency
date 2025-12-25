@@ -221,16 +221,6 @@ int latency_tc_ingress(struct __sk_buff *skb)
             return TC_ACT_OK;
         }
 
-        /* Kiểm tra là ACK (ACK flag set) */
-        if (!(tcph->ack))
-            return TC_ACT_OK;
-
-        /* Debug: count ACK packets received */
-        __u32 ack_key = 6;
-        __u64 *ack_cnt = bpf_map_lookup_elem(&stats, &ack_key);
-        if (ack_cnt)
-            *ack_cnt += 1;
-
         /* Track bytes received (payload in this direction) */
         __u32 tcp_hdr_len = tcph->doff * 4;
         __u32 ip_total_len = bpf_ntohs(iph->tot_len);
@@ -241,6 +231,16 @@ int latency_tc_ingress(struct __sk_buff *skb)
         __u64 *bytes_recv = bpf_map_lookup_elem(&stats, &bytes_recv_key);
         if (bytes_recv)
             *bytes_recv += payload_len;
+
+        /* Kiểm tra là ACK (ACK flag set) */
+        if (!(tcph->ack))
+            return TC_ACT_OK;
+
+        /* Debug: count ACK packets received */
+        __u32 ack_key = 6;
+        __u64 *ack_cnt = bpf_map_lookup_elem(&stats, &ack_key);
+        if (ack_cnt)
+            *ack_cnt += 1;
 
         /* ACK number is the next expected SEQ (SEQ + payload_len from DATA packet) */
         key = bpf_ntohl(tcph->ack_seq);

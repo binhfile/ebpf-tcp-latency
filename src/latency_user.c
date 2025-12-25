@@ -168,6 +168,18 @@ static void print_report(struct latency_bpf *obj)
 
     dual_printf("  tx=%s rx=%s", tx_speed_str, rx_speed_str);
     dual_printf("\n");
+
+    /* Reset latency stats for next window (keep cumulative stats) */
+    values = calloc(nr_cpus, sizeof(__u64));
+    if (values) {
+        /* Reset sum and cnt across all CPUs */
+        for (int i = 0; i < nr_cpus; i++) {
+            values[i] = 0;
+        }
+        bpf_map_update_elem(fd, &sum_key, values, BPF_ANY);
+        bpf_map_update_elem(fd, &cnt_key, values, BPF_ANY);
+        free(values);
+    }
 }
 
 /* Ring‑buffer callback – chỉ để hiển thị chi tiết (tùy chọn) */
@@ -315,10 +327,10 @@ int main(int argc, char **argv)
             break;
         }
 
-        /* In báo cáo mỗi giây */
+        /* In báo cáo mỗi 2 giây */
         static time_t last = 0;
         time_t now = time(NULL);
-        if (now != last) {
+        if (now - last >= 2) {
             print_report(skel);
             last = now;
         }
