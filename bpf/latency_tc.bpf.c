@@ -15,10 +15,10 @@
 
 /* -------------------- Định nghĩa cấu trúc -------------------- */
 struct latency_event {
-    __u32 seq;          /* TCP seq của DATA */
-    __u32 ack;          /* TCP ack của ACK (trùng với seq) */
-    __u64 latency_ns;  /* thời gian (ns) */
-    __u8  direction;   /* 0 = data→, 1 = ack← */
+    __u32 seq;          /* TCP seq */
+    __u32 ack;          /* TCP ack */
+    __u64 latency_ns;  /* thời gian (ns) hoặc timestamp */
+    __u8  direction;   /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST */
 };
 
 /* -------------------- BPF maps -------------------- */
@@ -94,6 +94,7 @@ int latency_tc_egress(struct __sk_buff *skb)
     struct tcphdr  *tcph;
     __u64 ts;
     __u32 key;
+    struct latency_event *ev;
 
     /* Debug: count total packets */
     __u32 total_key = 2;
@@ -122,9 +123,23 @@ int latency_tc_egress(struct __sk_buff *skb)
         if (match_cnt)
             *match_cnt += 1;
 
-        /* Gói DATA (có payload) */
-        if (tcph->syn || tcph->fin)   /* bỏ SYN/FIN – không tính latency */
+        /* Report connection lifecycle events */
+        if (tcph->syn || tcph->fin || tcph->rst) {
+            ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+            if (ev) {
+                ev->seq = bpf_ntohl(tcph->seq);
+                ev->ack = bpf_ntohl(tcph->ack_seq);
+                ev->latency_ns = bpf_ktime_get_ns();
+                if (tcph->syn)
+                    ev->direction = 2;  /* SYN */
+                else if (tcph->fin)
+                    ev->direction = 3;  /* FIN */
+                else
+                    ev->direction = 4;  /* RST */
+                bpf_ringbuf_submit(ev, 0);
+            }
             return TC_ACT_OK;
+        }
 
         /* Debug: count data packets sent */
         __u32 data_key = 5;
@@ -180,6 +195,24 @@ int latency_tc_ingress(struct __sk_buff *skb)
         __u64 *match_cnt = bpf_map_lookup_elem(&stats, &match_key);
         if (match_cnt)
             *match_cnt += 1;
+
+        /* Report connection lifecycle events */
+        if (tcph->syn || tcph->fin || tcph->rst) {
+            ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+            if (ev) {
+                ev->seq = bpf_ntohl(tcph->seq);
+                ev->ack = bpf_ntohl(tcph->ack_seq);
+                ev->latency_ns = bpf_ktime_get_ns();
+                if (tcph->syn)
+                    ev->direction = 2;  /* SYN */
+                else if (tcph->fin)
+                    ev->direction = 3;  /* FIN */
+                else
+                    ev->direction = 4;  /* RST */
+                bpf_ringbuf_submit(ev, 0);
+            }
+            return TC_ACT_OK;
+        }
 
         /* Kiểm tra là ACK (ACK flag set) */
         if (!(tcph->ack))

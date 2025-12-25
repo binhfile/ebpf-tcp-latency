@@ -21,7 +21,7 @@ struct latency_event {
     __u32 seq;
     __u32 ack;
     __u64 latency_ns;
-    __u8  direction;
+    __u8  direction;  /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST */
 };
 
 static volatile bool exiting = false;
@@ -106,13 +106,36 @@ static void print_report(struct latency_tc_bpf *obj)
     printf("\n");
 }
 
-/* Ring‑buffer callback – chỉ để hiển thị chi tiết (tùy chọn) */
+/* Ring‑buffer callback – show connection lifecycle events */
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
-    /* Events disabled - only showing summary reports */
+    const struct latency_event *e = data;
     (void)ctx;
-    (void)data;
     (void)data_sz;
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[32];
+
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+
+    switch (e->direction) {
+        case 0:  /* DATA packet - skip */
+            break;
+        case 1:  /* ACK/latency measurement - skip */
+            break;
+        case 2:  /* SYN - new connection */
+            printf("[%s] [SYN] New connection initiated - seq=%u\n",
+                   time_str, e->seq);
+            break;
+        case 3:  /* FIN - connection closing */
+            printf("[%s] [FIN] Connection closing - seq=%u ack=%u\n",
+                   time_str, e->seq, e->ack);
+            break;
+        case 4:  /* RST - connection reset */
+            printf("[%s] [RST] Connection reset - seq=%u ack=%u\n",
+                   time_str, e->seq, e->ack);
+            break;
+    }
     return 0;
 }
 
