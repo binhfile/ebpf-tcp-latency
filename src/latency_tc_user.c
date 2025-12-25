@@ -252,10 +252,8 @@ static void print_report(struct latency_tc_bpf *obj)
     format_bytes(tx_speed, tx_speed_str, sizeof(tx_speed_str));
     format_bytes(rx_speed, rx_speed_str, sizeof(rx_speed_str));
 
-    dual_printf("[%-9s] total=%llu tcp=%llu matched=%llu data_sent=%llu ack_recv=%llu lookups=%llu num_samples=%llu",
-           "REPORT", (unsigned long long)total, (unsigned long long)tcp_cnt,
-           (unsigned long long)match_cnt, (unsigned long long)data_sent,
-           (unsigned long long)ack_recv, (unsigned long long)lookups, (unsigned long long)cnt);
+    dual_printf("[%-9s] num_samples=%llu",
+           "REPORT", (unsigned long long)cnt);
 
     if (cnt > 0) {
         double avg_us = (double)sum / cnt / 1000.0;   /* ns → µs */
@@ -333,15 +331,15 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
             }
             break;
         case 2:  /* SYN - new connection */
-            dual_printf("[%s] [SYN] New connection initiated - port %u:%u seq=%u\n",
+            dual_printf_color(COLOR_RED, "[%s] [SYN] New connection initiated - port %u:%u seq=%u\n",
                    time_str, e->src_port, e->dst_port, e->seq);
             break;
         case 3:  /* FIN - connection closing */
-            dual_printf("[%s] [FIN] Connection closing - port %u:%u seq=%u ack=%u\n",
+            dual_printf_color(COLOR_RED, "[%s] [FIN] Connection closing - port %u:%u seq=%u ack=%u\n",
                    time_str, e->src_port, e->dst_port, e->seq, e->ack);
             break;
         case 4:  /* RST - connection reset */
-            dual_printf("[%s] [RST] Connection reset - port %u:%u seq=%u ack=%u\n",
+            dual_printf_color(COLOR_RED, "[%s] [RST] Connection reset - port %u:%u seq=%u ack=%u\n",
                    time_str, e->src_port, e->dst_port, e->seq, e->ack);
             break;
     }
