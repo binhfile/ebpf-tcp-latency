@@ -34,7 +34,8 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);      /* 0 = sum latency, 1 = count, 2 = total pkts, 3 = tcp pkts, 4 = matched pkts
-                                5 = data_sent, 6 = ack_recv, 7 = pending_lookups */
+                                5 = data_sent, 6 = ack_recv, 7 = pending_lookups
+                                8 = bytes_sent, 9 = bytes_recv */
     __type(value, __u64);
     __uint(max_entries, 16);
 } stats SEC(".maps");
@@ -151,6 +152,12 @@ int latency_xdp_prog(struct xdp_md *ctx)
         if (payload_len == 0)
             return XDP_PASS;
 
+        /* Track bytes sent */
+        __u32 bytes_sent_key = 8;
+        __u64 *bytes_sent = bpf_map_lookup_elem(&stats, &bytes_sent_key);
+        if (bytes_sent)
+            *bytes_sent += payload_len;
+
         /* Store timestamp at SEQ + payload_len (the expected ACK number) */
         key = bpf_ntohl(tcph->seq) + payload_len;
         ts  = bpf_ktime_get_ns();
@@ -176,6 +183,17 @@ int latency_xdp_prog(struct xdp_md *ctx)
         __u64 *ack_cnt = bpf_map_lookup_elem(&stats, &ack_key);
         if (ack_cnt)
             *ack_cnt += 1;
+
+        /* Track bytes received (payload in this direction) */
+        __u32 tcp_hdr_len = tcph->doff * 4;
+        __u32 ip_total_len = bpf_ntohs(iph->tot_len);
+        __u32 ip_hdr_len = iph->ihl * 4;
+        __u32 payload_len = ip_total_len - ip_hdr_len - tcp_hdr_len;
+
+        __u32 bytes_recv_key = 9;
+        __u64 *bytes_recv = bpf_map_lookup_elem(&stats, &bytes_recv_key);
+        if (bytes_recv)
+            *bytes_recv += payload_len;
 
         /* ACK number is the next expected SEQ (SEQ + payload_len from DATA packet) */
         key = bpf_ntohl(tcph->ack_seq);

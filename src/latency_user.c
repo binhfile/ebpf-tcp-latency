@@ -24,10 +24,47 @@ struct latency_event {
 };
 
 static volatile bool exiting = false;
+static FILE *logfile = NULL;
 
 static void sig_handler(int sig)
 {
     exiting = true;
+}
+
+/* Helper to print to both stdout and log file */
+static void dual_printf(const char *format, ...)
+{
+    va_list args1, args2;
+
+    va_start(args1, format);
+    va_copy(args2, args1);
+
+    /* Print to stdout */
+    vprintf(format, args1);
+    fflush(stdout);
+
+    /* Print to log file if open */
+    if (logfile) {
+        vfprintf(logfile, format, args2);
+        fflush(logfile);
+    }
+
+    va_end(args1);
+    va_end(args2);
+}
+
+/* Format bytes to human readable */
+static void format_bytes(double bytes, char *buf, size_t buf_size)
+{
+    const char *units[] = {"B/s", "KB/s", "MB/s", "GB/s"};
+    int unit_idx = 0;
+
+    while (bytes >= 1024.0 && unit_idx < 3) {
+        bytes /= 1024.0;
+        unit_idx++;
+    }
+
+    snprintf(buf, buf_size, "%.2f %s", bytes, units[unit_idx]);
 }
 
 /* Hàm in báo cáo mỗi giây */
@@ -35,11 +72,19 @@ static void print_report(struct latency_bpf *obj)
 {
     __u32 sum_key = 0, cnt_key = 1, total_key = 2, tcp_key = 3, match_key = 4;
     __u32 data_key = 5, ack_key = 6, lookup_key = 7;
+    __u32 bytes_sent_key = 8, bytes_recv_key = 9;
     __u64 sum = 0, cnt = 0, total = 0, tcp_cnt = 0, match_cnt = 0;
     __u64 data_sent = 0, ack_recv = 0, lookups = 0;
+    __u64 bytes_sent = 0, bytes_recv = 0;
     int fd = bpf_map__fd(obj->maps.stats);
     int nr_cpus = libbpf_num_possible_cpus();
     __u64 *values;
+
+    static __u64 prev_bytes_sent = 0, prev_bytes_recv = 0;
+    static time_t prev_time = 0;
+    time_t now = time(NULL);
+    double tx_speed = 0, rx_speed = 0;
+    char tx_speed_str[32], rx_speed_str[32];
 
     if (nr_cpus <= 0) {
         fprintf(stderr, "Failed to get number of CPUs\n");
@@ -85,19 +130,44 @@ static void print_report(struct latency_bpf *obj)
         for (int i = 0; i < nr_cpus; i++)
             lookups += values[i];
     }
+    if (bpf_map_lookup_elem(fd, &bytes_sent_key, values) == 0) {
+        for (int i = 0; i < nr_cpus; i++)
+            bytes_sent += values[i];
+    }
+    if (bpf_map_lookup_elem(fd, &bytes_recv_key, values) == 0) {
+        for (int i = 0; i < nr_cpus; i++)
+            bytes_recv += values[i];
+    }
 
     free(values);
 
-    printf("[%-9s] total=%llu tcp=%llu matched=%llu data_sent=%llu ack_recv=%llu lookups=%llu latency=%llu",
+    /* Calculate speed */
+    if (prev_time > 0) {
+        time_t time_delta = now - prev_time;
+        if (time_delta > 0) {
+            tx_speed = (double)(bytes_sent - prev_bytes_sent) / time_delta;
+            rx_speed = (double)(bytes_recv - prev_bytes_recv) / time_delta;
+        }
+    }
+    prev_bytes_sent = bytes_sent;
+    prev_bytes_recv = bytes_recv;
+    prev_time = now;
+
+    format_bytes(tx_speed, tx_speed_str, sizeof(tx_speed_str));
+    format_bytes(rx_speed, rx_speed_str, sizeof(rx_speed_str));
+
+    dual_printf("[%-9s] total=%llu tcp=%llu matched=%llu data_sent=%llu ack_recv=%llu lookups=%llu latency=%llu",
            "REPORT", (unsigned long long)total, (unsigned long long)tcp_cnt,
            (unsigned long long)match_cnt, (unsigned long long)data_sent,
            (unsigned long long)ack_recv, (unsigned long long)lookups, (unsigned long long)cnt);
 
     if (cnt > 0) {
         double avg_us = (double)sum / cnt / 1000.0;   /* ns → µs */
-        printf("  avg=%.3f µs", avg_us);
+        dual_printf("  avg=%.3f µs", avg_us);
     }
-    printf("\n");
+
+    dual_printf("  tx=%s rx=%s", tx_speed_str, rx_speed_str);
+    dual_printf("\n");
 }
 
 /* Ring‑buffer callback – chỉ để hiển thị chi tiết (tùy chọn) */
@@ -214,6 +284,15 @@ int main(int argc, char **argv)
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
+    /* Open log file */
+    logfile = fopen("log.txt", "a");
+    if (!logfile) {
+        fprintf(stderr, "Warning: Failed to open log.txt for writing: %s\n", strerror(errno));
+        fprintf(stderr, "Continuing without file logging...\n");
+    } else {
+        printf("✓ Logging to log.txt\n");
+    }
+
     printf("=== eBPF latency monitor ===\n");
     printf("Interface: %s (ifindex=%u)\n", ifname, ifindex);
     printf("Target IP: %s\n", target_ip_str);
@@ -256,5 +335,12 @@ cleanup:
     }
 
     latency_bpf__destroy(skel);
+
+    /* Close log file */
+    if (logfile) {
+        fclose(logfile);
+        logfile = NULL;
+    }
+
     return err != 0;
 }
