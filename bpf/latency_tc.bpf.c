@@ -56,6 +56,14 @@ struct {
     __uint(max_entries, 1 << 20);   /* 1 MiB */
 } events SEC(".maps");
 
+// Define a per-CPU array map for storing payload buffer
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, char[1024]);  // Adjust size as needed
+} payload_buffer SEC(".maps");
+
 /* Target IP address - set from userspace via command line
  * Set to 0 to capture ALL TCP packets (filter in userspace) */
 volatile const __u32 target_ip = 0;
@@ -163,10 +171,12 @@ int latency_tc_egress(struct __sk_buff *skb)
         __u32 ip_total_len = bpf_ntohs(iph->tot_len);
         __u32 ip_hdr_len = iph->ihl * 4;
         __u32 payload_len = ip_total_len - ip_hdr_len - tcp_hdr_len;
-
         /* Only track packets with payload */
         if (payload_len == 0)
             return TC_ACT_OK;
+
+        __u32 packet_len = data_end - data;
+        bpf_printk("packet_len=%u payload_len=%u", packet_len, payload_len); 
 
         /* Track bytes sent */
         __u32 bytes_sent_key = 8;
