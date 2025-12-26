@@ -14,9 +14,11 @@
 #include <linux/if_link.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <sys/stat.h>
 #include "latency_tc.skel.h"
 
 #define TCP_PAYLOAD_REPORT_SIZE (1024)
+#define PATTERN_MAX_SIZE 32
 /* latency_event structure from BPF code */
 struct latency_event {
     __u32 seq;
@@ -43,6 +45,8 @@ static int num_port_stats = 0;
 
 static volatile bool exiting = false;
 static FILE *logfile = NULL;
+static const char *payload_save_dir = NULL;
+static int payload_file_index = 0;
 
 /* ANSI color codes */
 #define COLOR_RED "\033[1;31m"
@@ -109,11 +113,11 @@ static void dual_printf_color(const char *color, const char *format, ...)
 void hexdump(const unsigned char *data, size_t len)
 {
     size_t i, j;
-    
+
     for (i = 0; i < len; i += 16) {
         // Print offset
         printf("%08zx  ", i);
-        
+
         // Print hex bytes
         for (j = 0; j < 16; j++) {
             if (i + j < len) {
@@ -121,23 +125,64 @@ void hexdump(const unsigned char *data, size_t len)
             } else {
                 printf("   ");
             }
-            
+
             // Extra space between 8 bytes
             if (j == 7) {
                 printf(" ");
             }
         }
-        
+
         printf(" |");
-        
+
         // Print ASCII
         for (j = 0; j < 16 && i + j < len; j++) {
             unsigned char c = data[i + j];
             printf("%c", (c >= 32 && c <= 126) ? c : '.');
         }
-        
+
         printf("|\n");
     }
+}
+
+/* Save payload to file with timestamp and index */
+static int save_payload_to_file(const unsigned char *payload, size_t len)
+{
+    if (!payload_save_dir)
+        return -1;
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char filename[512];
+
+    /* Format: yyyy_mm_dd_hh_MM_ss.index.bin */
+    snprintf(filename, sizeof(filename), "%s/%04d_%02d_%02d_%02d_%02d_%02d.%d.bin",
+             payload_save_dir,
+             tm_info->tm_year + 1900,
+             tm_info->tm_mon + 1,
+             tm_info->tm_mday,
+             tm_info->tm_hour,
+             tm_info->tm_min,
+             tm_info->tm_sec,
+             payload_file_index);
+
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s for writing: %s\n", filename, strerror(errno));
+        return -1;
+    }
+
+    size_t written = fwrite(payload, 1, len, f);
+    fclose(f);
+
+    if (written != len) {
+        fprintf(stderr, "Warning: only wrote %zu/%zu bytes to %s\n", written, len, filename);
+        return -1;
+    }
+
+    dual_printf("  Saved to: %s (%zu bytes)\n", filename, len);
+    payload_file_index++;
+
+    return 0;
 }
 /* Find or create port stats entry */
 static struct port_stats* get_port_stats(__u16 local_port, __u16 remote_port)
@@ -383,7 +428,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
                 /* Print pattern match notification */
                 dual_printf_color(COLOR_RED, "[%s] [PATTERN MATCH] port %u:%u payload_len=%u\n",
                        time_str, e->src_port, e->dst_port, e->payload_len);
-                hexdump(e->payload, e->payload_len > TCP_PAYLOAD_REPORT_SIZE ? TCP_PAYLOAD_REPORT_SIZE : e->payload_len);
+
+                size_t display_len = e->payload_len > TCP_PAYLOAD_REPORT_SIZE ? TCP_PAYLOAD_REPORT_SIZE : e->payload_len;
+                hexdump(e->payload, display_len);
+
+                /* Save payload to file if directory is configured */
+                if (payload_save_dir) {
+                    save_payload_to_file(e->payload, display_len);
+                }
             }
             break;
     }
@@ -409,15 +461,17 @@ int main(int argc, char **argv)
     bool hook_created = false;
 
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <ifname> <target_ip> [--no-eth] [--log <filename>] [--search <pattern>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <ifname> <target_ip> [--no-eth] [--log <filename>] [--search <pattern>] [--save-payloads <dir>]\n", argv[0]);
         fprintf(stderr, "  --no-eth: Use for TUN interfaces (no Ethernet header)\n");
         fprintf(stderr, "  --log <filename>: Specify log file (default: log.txt)\n");
         fprintf(stderr, "  --search <pattern>: Search for pattern in outbound packet payloads\n");
+        fprintf(stderr, "  --save <dir>: Save matched payloads to binary files in directory\n");
         fprintf(stderr, "Examples:\n");
         fprintf(stderr, "  %s eth0 10.0.0.2\n", argv[0]);
         fprintf(stderr, "  %s tun0 112.11.0.100 --no-eth\n", argv[0]);
         fprintf(stderr, "  %s enp0s31f6 192.168.100.70 --log my_latency.log\n", argv[0]);
         fprintf(stderr, "  %s eth0 192.168.1.100 --search \"GET /api/\"\n", argv[0]);
+        fprintf(stderr, "  %s eth0 192.168.1.100 --search \"POST\" --save-payloads ./payloads\n", argv[0]);
         return 1;
     }
     ifname = argv[1];
@@ -439,13 +493,37 @@ int main(int argc, char **argv)
                 return 1;
             }
             search_pattern_str = argv[++i];
-            if (strlen(search_pattern_str) > 63) {
-                fprintf(stderr, "Error: search pattern too long (max 63 bytes)\n");
+            if (strlen(search_pattern_str) > PATTERN_MAX_SIZE) {
+                fprintf(stderr, "Error: search pattern too long (max %u bytes)\n", PATTERN_MAX_SIZE);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--save") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --save requires a directory argument\n");
+                return 1;
+            }
+            payload_save_dir = argv[++i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
+        }
+    }
+
+    /* Verify/create payload save directory if specified */
+    if (payload_save_dir) {
+        struct stat st;
+        if (stat(payload_save_dir, &st) == -1) {
+            /* Directory doesn't exist, try to create it */
+            if (mkdir(payload_save_dir, 0755) == -1) {
+                fprintf(stderr, "Error: Cannot create directory %s: %s\n", payload_save_dir, strerror(errno));
+                return 1;
+            }
+            printf("✓ Created payload directory: %s\n", payload_save_dir);
+        } else if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Error: %s exists but is not a directory\n", payload_save_dir);
+            return 1;
+        } else {
+            printf("✓ Using payload directory: %s\n", payload_save_dir);
         }
     }
 
@@ -567,12 +645,18 @@ int main(int argc, char **argv)
     printf("Mode: %s\n", no_eth ? "TUN/raw IP (no Ethernet header)" : "Ethernet");
     if (search_pattern_str) {
         printf("Search pattern: \"%s\" (%zu bytes)\n", search_pattern_str, strlen(search_pattern_str));
+        if (payload_save_dir) {
+            printf("Payload saving: Enabled to directory '%s'\n", payload_save_dir);
+        }
     }
     printf("Monitoring:\n");
     printf("  - Outbound (egress): TCP packets with dest IP = %s\n", target_ip_str);
     printf("  - Inbound (ingress): TCP packets with src IP = %s and ACK flag set\n", target_ip_str);
     if (search_pattern_str) {
         printf("  - Payload search: Will notify when pattern is found in outbound packets\n");
+        if (payload_save_dir) {
+            printf("  - Matched payloads will be saved to %s/YYYY_MM_DD_HH_MM_SS.N.bin\n", payload_save_dir);
+        }
     }
     printf("\nPress Ctrl‑C to quit.\n\n");
 
