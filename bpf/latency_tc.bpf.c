@@ -13,6 +13,8 @@
 #define BPF_MAP_TYPE_RINGBUF 27
 #endif
 
+#define TCP_PAYLOAD_SEARCH_MAX_SIZE 8192
+
 /* -------------------- Định nghĩa cấu trúc -------------------- */
 struct latency_event {
     __u32 seq;          /* TCP seq */
@@ -20,7 +22,8 @@ struct latency_event {
     __u64 latency_ns;  /* thời gian (ns) hoặc timestamp */
     __u16 src_port;    /* Source port */
     __u16 dst_port;    /* Destination port */
-    __u8  direction;   /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST */
+    __u8  direction;   /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST, 5 = SEARCH_MATCH */
+    __u32 payload_len; /* Payload length (for search matches) */
 };
 
 /* Pending entry - stores timestamp and port info for each DATA packet */
@@ -61,7 +64,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, char[1024]);  // Adjust size as needed
+    __type(value, char[8192]);  // Increased to handle larger payloads
 } payload_buffer SEC(".maps");
 
 /* Target IP address - set from userspace via command line
@@ -71,7 +74,43 @@ volatile const __u32 target_ip = 0;
 /* Skip Ethernet header for TUN/raw IP interfaces - set from userspace */
 volatile const __u8 no_eth = 0;
 
+/* Search pattern - set from userspace */
+volatile const char search_pattern[64] = {};
+volatile const __u32 search_pattern_len = 0;
+
 /* -------------------- Helper -------------------- */
+
+/* Simple pattern search in buffer - returns 1 if found, 0 if not found */
+static __always_inline int find_pattern(const char *buf, __u32 buf_len,
+                                         const char *pattern, __u32 pattern_len)
+{
+    if (pattern_len == 0 || pattern_len > buf_len)
+        return 0;
+
+    /* Simple brute force search - limit iterations for verifier */
+    #pragma unroll
+    for (__u32 i = 0; i < 64; i++) {
+        if (i + pattern_len > buf_len)
+            break;
+
+        int match = 1;
+        #pragma unroll
+        for (__u32 j = 0; j < 64; j++) {
+            if (j >= pattern_len)
+                break;
+            if (buf[i + j] != pattern[j]) {
+                match = 0;
+                break;
+            }
+        }
+
+        if (match)
+            return 1;
+    }
+
+    return 0;
+}
+
 static __always_inline int parse_tcp(void *data, void *data_end,
                      struct iphdr **iph, struct tcphdr **tcph)
 {
@@ -170,13 +209,77 @@ int latency_tc_egress(struct __sk_buff *skb)
         __u32 tcp_hdr_len = tcph->doff * 4;
         __u32 ip_total_len = bpf_ntohs(iph->tot_len);
         __u32 ip_hdr_len = iph->ihl * 4;
-        __u32 payload_len = ip_total_len - ip_hdr_len - tcp_hdr_len;
+
+        /* Bounds check to prevent underflow */
+        __u32 headers_len = ip_hdr_len + tcp_hdr_len;
+        if (ip_total_len <= headers_len)
+            return TC_ACT_OK;  /* No payload or malformed packet */
+
+        __u32 payload_len = ip_total_len - headers_len;
         /* Only track packets with payload */
         if (payload_len == 0)
             return TC_ACT_OK;
 
-        __u32 packet_len = data_end - data;
-        bpf_printk("packet_len=%u payload_len=%u", packet_len, payload_len); 
+        /* Calculate payload offset in SKB */
+        __u32 payload_offset = 0;
+        if (!no_eth)
+            payload_offset += sizeof(struct ethhdr);
+        payload_offset += ip_hdr_len + tcp_hdr_len;
+
+        /* Load full payload data using bpf_skb_load_bytes() */
+        __u32 buf_key = 0;
+        char *buf = bpf_map_lookup_elem(&payload_buffer, &buf_key);
+        if (!buf)
+            return TC_ACT_OK;
+
+        /* Load payload - limit to buffer size (8192 bytes) */
+        //__u32 bytes_to_read = payload_len > 8192 ? 8192 : payload_len;
+        __u32 bytes_to_read = payload_len > TCP_PAYLOAD_SEARCH_MAX_SIZE ? TCP_PAYLOAD_SEARCH_MAX_SIZE : payload_len;
+        /* Ensure verifier knows this is bounded and positive */
+        bytes_to_read &= 0x1fff;  /* Max 8191 */
+        if (bytes_to_read == 0)
+            return TC_ACT_OK;
+        if (bpf_skb_load_bytes(skb, payload_offset, buf, bytes_to_read) < 0) {
+            bpf_printk("failed to load payload at offset %u", payload_offset);
+            return TC_ACT_OK;
+        }
+
+        // bpf_printk("loaded %u/%u bytes of payload", bytes_to_read, payload_len);
+        if (bytes_to_read >= 4) {
+            // bpf_printk("first 2 bytes: %02x %02x", buf[0] & 0xff, buf[1] & 0xff);
+            // bpf_printk("next 2 bytes: %02x %02x", buf[2] & 0xff, buf[3] & 0xff);
+        }
+
+        /* Search for pattern if configured */
+        if (search_pattern_len > 0 && search_pattern_len <= 64) {
+            if (find_pattern(buf, bytes_to_read, search_pattern, search_pattern_len)) {
+                // Pattern found - send event 
+                ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+                if (ev) {
+                    ev->seq = bpf_ntohl(tcph->seq);
+                    ev->ack = bpf_ntohl(tcph->ack_seq);
+                    ev->latency_ns = bpf_ktime_get_ns();
+                    ev->src_port = bpf_ntohs(tcph->source);
+                    ev->dst_port = bpf_ntohs(tcph->dest);
+                    ev->direction = 5;  // SEARCH_MATCH
+                    ev->payload_len = payload_len;
+
+                    // Copy first 64 bytes of payload as preview
+                    // __u32 preview_len = bytes_to_read > 64 ? 64 : bytes_to_read;
+                    // #pragma unroll
+                    // for (__u32 i = 0; i < 64; i++) {
+                    //     if (i < preview_len)
+                    //         ev->payload_preview[i] = buf[i];
+                    //     else
+                    //         ev->payload_preview[i] = 0;
+                    // }
+
+                    bpf_ringbuf_submit(ev, 0);
+                    // bpf_printk("PATTERN MATCH! port %u:%u payload_len=%u",
+                    //            ev->src_port, ev->dst_port, payload_len);
+                }
+            }
+        }
 
         /* Track bytes sent */
         __u32 bytes_sent_key = 8;

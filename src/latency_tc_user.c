@@ -23,7 +23,8 @@ struct latency_event {
     __u64 latency_ns;
     __u16 src_port;
     __u16 dst_port;
-    __u8  direction;  /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST */
+    __u8  direction;  /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST, 5 = SEARCH_MATCH */
+    __u32 payload_len;
 };
 
 /* Per-port statistics */
@@ -342,6 +343,13 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
             dual_printf_color(COLOR_RED, "[%s] [RST] Connection reset - port %u:%u seq=%u ack=%u\n",
                    time_str, e->src_port, e->dst_port, e->seq, e->ack);
             break;
+        case 5:  /* SEARCH_MATCH - pattern found in payload */
+            {
+                /* Print pattern match notification */
+                dual_printf_color(COLOR_RED, "[%s] [PATTERN MATCH] port %u:%u payload_len=%u\n",
+                       time_str, e->src_port, e->dst_port, e->payload_len);
+            }
+            break;
     }
     return 0;
 }
@@ -354,6 +362,7 @@ int main(int argc, char **argv)
     const char *ifname = NULL;
     const char *target_ip_str = NULL;
     const char *log_filename = "log.txt";  /* Default log file */
+    const char *search_pattern_str = NULL; /* Search pattern */
     __u32 ifindex = 0;
     __u32 target_ip_host = 0;
     struct in_addr addr;
@@ -364,13 +373,15 @@ int main(int argc, char **argv)
     bool hook_created = false;
 
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <ifname> <target_ip> [--no-eth] [--log <filename>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <ifname> <target_ip> [--no-eth] [--log <filename>] [--search <pattern>]\n", argv[0]);
         fprintf(stderr, "  --no-eth: Use for TUN interfaces (no Ethernet header)\n");
         fprintf(stderr, "  --log <filename>: Specify log file (default: log.txt)\n");
+        fprintf(stderr, "  --search <pattern>: Search for pattern in outbound packet payloads\n");
         fprintf(stderr, "Examples:\n");
         fprintf(stderr, "  %s eth0 10.0.0.2\n", argv[0]);
         fprintf(stderr, "  %s tun0 112.11.0.100 --no-eth\n", argv[0]);
         fprintf(stderr, "  %s enp0s31f6 192.168.100.70 --log my_latency.log\n", argv[0]);
+        fprintf(stderr, "  %s eth0 192.168.1.100 --search \"GET /api/\"\n", argv[0]);
         return 1;
     }
     ifname = argv[1];
@@ -386,6 +397,16 @@ int main(int argc, char **argv)
                 return 1;
             }
             log_filename = argv[++i];
+        } else if (strcmp(argv[i], "--search") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --search requires a pattern argument\n");
+                return 1;
+            }
+            search_pattern_str = argv[++i];
+            if (strlen(search_pattern_str) > 63) {
+                fprintf(stderr, "Error: search pattern too long (max 63 bytes)\n");
+                return 1;
+            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -423,6 +444,13 @@ int main(int argc, char **argv)
     /* Set target IP address and no_eth flag before loading */
     skel->rodata->target_ip = target_ip_host;
     skel->rodata->no_eth = no_eth;
+
+    /* Set search pattern if provided */
+    if (search_pattern_str) {
+        size_t pattern_len = strlen(search_pattern_str);
+        memcpy((void*)skel->rodata->search_pattern, search_pattern_str, pattern_len);
+        *(__u32*)&skel->rodata->search_pattern_len = pattern_len;
+    }
 
     err = latency_tc_bpf__load(skel);
     if (err) {
@@ -501,9 +529,15 @@ int main(int argc, char **argv)
     printf("  - Host byte order: 0x%08X\n", target_ip_host);
     printf("  - Network byte order: 0x%08X\n", htonl(target_ip_host));
     printf("Mode: %s\n", no_eth ? "TUN/raw IP (no Ethernet header)" : "Ethernet");
+    if (search_pattern_str) {
+        printf("Search pattern: \"%s\" (%zu bytes)\n", search_pattern_str, strlen(search_pattern_str));
+    }
     printf("Monitoring:\n");
     printf("  - Outbound (egress): TCP packets with dest IP = %s\n", target_ip_str);
     printf("  - Inbound (ingress): TCP packets with src IP = %s and ACK flag set\n", target_ip_str);
+    if (search_pattern_str) {
+        printf("  - Payload search: Will notify when pattern is found in outbound packets\n");
+    }
     printf("\nPress Ctrl‑C to quit.\n\n");
 
     /* Main loop */
