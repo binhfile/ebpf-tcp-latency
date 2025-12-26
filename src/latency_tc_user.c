@@ -16,6 +16,7 @@
 #include <bpf/bpf.h>
 #include "latency_tc.skel.h"
 
+#define TCP_PAYLOAD_REPORT_SIZE (1024)
 /* latency_event structure from BPF code */
 struct latency_event {
     __u32 seq;
@@ -25,6 +26,7 @@ struct latency_event {
     __u16 dst_port;
     __u8  direction;  /* 0 = data→, 1 = ack←, 2 = SYN, 3 = FIN, 4 = RST, 5 = SEARCH_MATCH */
     __u32 payload_len;
+    __u8 payload[TCP_PAYLOAD_REPORT_SIZE];
 };
 
 /* Per-port statistics */
@@ -103,7 +105,40 @@ static void dual_printf_color(const char *color, const char *format, ...)
     va_end(args1);
     va_end(args2);
 }
-
+// Hexdump function
+void hexdump(const unsigned char *data, size_t len)
+{
+    size_t i, j;
+    
+    for (i = 0; i < len; i += 16) {
+        // Print offset
+        printf("%08zx  ", i);
+        
+        // Print hex bytes
+        for (j = 0; j < 16; j++) {
+            if (i + j < len) {
+                printf("%02x ", data[i + j]);
+            } else {
+                printf("   ");
+            }
+            
+            // Extra space between 8 bytes
+            if (j == 7) {
+                printf(" ");
+            }
+        }
+        
+        printf(" |");
+        
+        // Print ASCII
+        for (j = 0; j < 16 && i + j < len; j++) {
+            unsigned char c = data[i + j];
+            printf("%c", (c >= 32 && c <= 126) ? c : '.');
+        }
+        
+        printf("|\n");
+    }
+}
 /* Find or create port stats entry */
 static struct port_stats* get_port_stats(__u16 local_port, __u16 remote_port)
 {
@@ -348,6 +383,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
                 /* Print pattern match notification */
                 dual_printf_color(COLOR_RED, "[%s] [PATTERN MATCH] port %u:%u payload_len=%u\n",
                        time_str, e->src_port, e->dst_port, e->payload_len);
+                hexdump(e->payload, e->payload_len > TCP_PAYLOAD_REPORT_SIZE ? TCP_PAYLOAD_REPORT_SIZE : e->payload_len);
             }
             break;
     }
